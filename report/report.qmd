@@ -1,0 +1,815 @@
+---
+title: Homework 9 - World Bank - Population Analysis
+author:
+    - name: Alexa Lauer
+      email: lauera@vcu.edu
+date: last-modified
+format:
+    html:
+        theme: cosmo
+        toc: false
+        embed-resources: true
+        code-copy: true
+execute:
+  echo: true
+  eval: true
+  cache: false
+---
+In this assignment, we explored various SQL techniques to analyze data from the World Development Indicators (WDI) dataset, focusing on countries categorized by regions and income groups as defined by the World Bank. This exercise demonstrated how data transformation and querying can yield actionable insights, aligning with the World Bank’s mission to provide data-driven solutions for global development challenges.
+
+
+GITHUB URL:  <https://github.com/cmsc-vcu/cmsc408-fa2024-hw9-alexalauer>
+
+
+# Problem Background
+
+The World Bank, an international financial institution, works to reduce poverty and promote economic development in low and middle-income countries through financial aid, technical expertise, and research. Central to this mission is the World Development Indicators (WDI) database, which provides comprehensive economic and social statistics, such as GDP, education, health, and poverty metrics. For this assignment, I will analyze WDI data to uncover key insights about global development trends.
+
+```{python}
+#| echo: false
+import os
+import re
+import sys
+import copy
+import random
+import pandas as pd
+from tabulate import tabulate
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import ArgumentError, NoSuchModuleError, OperationalError, ProgrammingError
+
+def run_sql_and_return_df(cnx, sql, show_size=True):
+    """Given an SQL command and connection string, return a DataFrame."""
+
+    # Check if the connection is None
+    if cnx is None:
+        error_message = "No valid connection. See above."
+        df = pd.DataFrame({'ErrorType': ['ConnectionError'], 'ErrorMessage': [error_message]})
+
+    try:
+        df = pd.read_sql(sql, cnx)
+        if df.empty:
+            # Create a single-row DataFrame with all columns as None
+            df = pd.DataFrame([["no records returned"]+ [''] * (len(df.columns) - 1) ], columns=df.columns)
+
+        df = df.replace("None","NULL")
+        return df
+
+    except OperationalError as e:
+        # Catch connection or database errors
+        error_message = f"Operational Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['OperationalError'], 'ErrorMessage': [error_message]})
+    except ProgrammingError as e:
+        # Catch SQL syntax errors or issues with the command
+        error_message = f"Programming Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['ProgrammingError'], 'ErrorMessage': [error_message]})
+#    except mysql.connector.Error as e:
+#        # Catch MySQL-specific errors
+#        error_message = f"MySQL Connector Error: {str(e)}"
+#        df = pd.DataFrame({'ErrorType': ['MySQL Connector Error'], 'ErrorMessage': [error_message]})
+    except Exception as e:
+        # Catch all other exceptions
+        error_message = f"Unknown Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['UnknownError'], 'ErrorMessage': [error_message]})
+    
+    return df
+
+def run_sql_and_return_html( cnx, sql, show_size=True):
+    """ """
+    df = run_sql_and_return_df( cnx, sql, show_size )
+
+    # Convert the DataFrame to HTML and use custom styling to span columns if needed
+    html_output = df.to_html(index=False, na_rep="NULL", justify="center")
+    html_output = re.sub(r'\bNone\b', 'NULL', html_output)
+    
+    # Add colspan attribute to span columns if rendering in an environment that supports it
+    html_output = html_output.replace('<td>no records found</td>', f'<td colspan="{len(df.columns)}">no records found</td>')
+    
+    # Append a row at the bottom with row and column count information
+    if show_size and (len(df)>0):
+        row_count = len(df)
+        col_count = len(df.columns)
+        count_row = f'<tr><td colspan="{col_count}" style="text-align: left;">Total Rows: {row_count}, Total Columns: {col_count}</td></tr>'
+        html_output = html_output.replace('</tbody>', f'{count_row}</tbody>')
+
+    return html_output
+
+def create_database_engine(uri):
+    """Create an SQLAlchemy engine with error handling and test the connection."""
+
+    try:
+        # Attempt to create the engine
+        engine = create_engine(uri)
+
+        # Test the connection with a lightweight query
+
+        run_sql_and_return_df(engine,"select 1 from dual")
+
+#        with engine.connect() as connection:
+#            connection.execute(text("SELECT 1"))
+        
+        return engine  # Return the engine if connection test is successful
+
+    except ArgumentError as e:
+        error_message = f"URI Error: {e}"
+    except NoSuchModuleError as e:
+        error_message = f"Database driver not found: {e}"
+    except OperationalError as e:
+        error_message = f"Operational error: {e}"
+    except Exception as e:
+        error_message = f"An unexpected error occurred: {e}"
+    
+    return None  # Return None if any error occurs
+
+def split_sql_commands(sql):
+    # Initialize default delimiter
+    delimiter = ';'
+    statements = []
+    buffer = []
+
+    # Split on newline to process line by line
+    lines = sql.splitlines()
+    
+    for line in lines:
+        # Check if the line is a DELIMITER command
+        delimiter_match = re.match(r'^DELIMITER\s+(\S+)', line.strip(), re.IGNORECASE)
+        
+        if delimiter_match:
+            # If there's a buffer with previous statements, join them and add to statements
+            if buffer:
+                statements.append(" ".join(buffer).strip())
+                buffer = []
+            # Set the new delimiter from DELIMITER command
+            delimiter = delimiter_match.group(1)
+            continue
+
+        # Use the current delimiter to split statements
+        parts = re.split(re.escape(delimiter), line)
+        
+        # Process all parts except the last (incomplete) part
+        for part in parts[:-1]:
+            buffer.append(part)
+            statements.append(" ".join(buffer).strip())
+            buffer = []
+
+        # The last part may be incomplete, so add it to the buffer
+        buffer.append(parts[-1])
+
+    # Add any remaining buffer as the last statement
+    if buffer:
+        statements.append(" ".join(buffer).strip())
+        
+    return [stmt for stmt in statements if stmt]
+
+
+def execute_ddl(cnx,ddl_commands):
+    """
+    Executes DDL statements from a file on a given SQLAlchemy connection, 
+    capturing any errors and results.
+    """
+    messages = []
+    errors = []
+
+    # Check if the connection is None
+    if cnx is None:
+        error_message = "No valid connection. See above."
+        df = pd.DataFrame({'ErrorType': ['ConnectionError'], 'ErrorMessage': [error_message]})
+        return df.to_html(index=False)
+
+    # Split commands if needed
+    ddl_statements = split_sql_commands( ddl_commands )
+#    ddl_statements = [cmd.strip() for cmd in ddl_commands.split(';') if cmd.strip()]
+
+    with cnx.connect() as connection:
+        for statement in ddl_statements:
+            try:
+                result = connection.execute(text(statement))
+                # Capture the result, if any
+                result_info = result.rowcount if result.rowcount != -1 else "No rows affected"
+                messages.append(f"Executed statement: {statement}<br/>Result: {result_info}<br/>")
+            except Exception as e:
+                # Capture the error message if execution fails
+                errors.append(f"<hr/>Error executing statement: <b>{statement}</b><br/>    Error: {str(e)}<br/>")
+
+#    return messages, errors
+
+    if errors:
+        df = pd.DataFrame({'Errors': errors})
+        return df.to_html(index=False)
+
+    return None
+
+```
+
+## Verify access to the world bank data
+
+```{python}
+#| echo: false
+#| output: asis
+
+# modify config_map to reflect credentials needed by this program
+# These variables are set in your .env file
+config_map = {
+    'user':'CMSC408_USER',
+    'password':'CMSC408_PASSWORD',
+    'host':'CMSC408_HOST',
+    'database':'HW9_DB_NAME'
+}
+# load and store credentials
+load_dotenv()
+config = {}
+for key in config_map.keys():
+    config[key] = os.getenv(config_map[key])
+
+errors = []
+for param in config.keys():
+    if config[param] is None:
+        flag = True
+        errors.append(f"Missing {config_map[param]} in .env file.")
+
+cnx = None
+error_df=""
+if errors:
+    errors.append("All subsequent SQL commands will fail.")
+    errors.append("Fix the .env file and rerun quarto ...")
+    # Convert errors to a DataFrame
+    error_df = pd.DataFrame({'Errors loading .env file': errors})
+    error_df
+else:
+# build a sqlalchemy engine string
+    engine_uri = f"mysql+pymysql://{config['user']}:{config['password']}@{config['host']}/{config['database']}"
+
+    # create and test the database connection.
+    cnx = create_database_engine( engine_uri )
+
+```
+
+We'll be using the following database connection attributes.  The password has been sanitized.
+
+```{python}
+#| echo: false
+clean_config = copy.deepcopy(config)
+clean_config['password'] = '...'
+clean_config
+```
+
+You should see 3 tables in the list below.
+
+
+```{python}
+# Do a quick test of the connection by listing all the WDI table in the world_bank_data schema.
+
+run_sql_and_return_html(cnx,f"""
+select
+  table_schema, table_name, table_rows
+from
+  information_schema.tables
+where
+  1=1
+  and table_name like 'wdi%%'
+  and table_schema = 'world_bank_data';
+""")
+
+```
+
+# Exercises
+
+## Task 1
+
+Clean up your _users_ schema.  Drop all the tables.  NOTE - if you have foreign keys
+set up in the schema, the order that you drop files will matter!
+
+```{python}
+# Drop wdi_country
+sql = """
+drop table if exists wdi_country;
+drop table if exists wdi_series;
+drop table if exists wdi_data;
+drop table if exists wdi_stacked_data;
+drop table if exists wdi_data_stacked;
+-- drop all other files in your schema.  It should be empty!
+commit;
+"""
+execute_ddl( cnx, sql );
+```
+
+Verify that it all worked.  This query should return "no records returned".
+
+```{python}
+run_sql_and_return_html(cnx,f"""
+select
+  table_schema, table_name, table_rows
+from
+  information_schema.tables
+where
+  1=1
+  and table_name like 'wdi%%'
+  and table_schema = DATABASE();
+""")
+```
+
+
+## Task 2
+
+Create a local copy of wdi_country with just countries.  
+
+```{python}
+sql = """
+drop table if exists wdi_country;
+"""
+execute_ddl( cnx, sql)
+```
+
+```{python}
+# create table
+execute_ddl(cnx,"""
+create table wdi_country as 
+select * from world_bank_data.wdi_country
+where not region is NULL
+""")
+```
+
+Verify that you've got the correct number of countries.
+
+```{python}
+run_sql_and_return_html(cnx,f"""
+select 'wdi_country',count(*) from wdi_country;
+""")
+```
+
+## Task 3
+
+
+```{python}
+## OK, but what the heck are these datum?  The WDI_SERIES data offer
+## "meta-data" that describes the "data" in the WDI_DATA file.  WRITE
+## a query that provides descriptions for the indicators in the WDI_DATA
+## table using information from the WDI_SERIES table.
+##
+## Your result should include 3 columns (series code, indicator name and
+## long definition)
+##
+## You need to determine which columns join the two tables.
+##
+## ALSO, use this filter:  where `Series Code` like 'SP.POP.TOTL%%'
+##
+## Use tables from the `world_bank_data` schema.  DO NOT make local copies!
+## 
+## (skills: select, subquery)
+
+
+
+run_sql_and_return_html(cnx, """
+SELECT 
+    s.`series code`,
+    s.`indicator name`,
+    s.`long definition`
+FROM 
+    world_bank_data.wdi_series s
+WHERE 
+    s.`series code` LIKE 'SP.POP.TOTL%%'
+ORDER BY 
+    s.`series code`;
+""")
+
+```
+
+## Task 4
+
+```{python}
+## INTERESTING! Now let's work with the WDI_DATA table.
+##
+## To start, write a quick query that takes a peek at the first
+## 10 records or so of WDI_DATA.
+##
+## Umh... It seems that each row of the WDI_SERIES file contains
+## data for a single measure (or indicator) for the years 1960 to 2023
+##
+## ARE YOU READY?
+##
+## What was the world population in 1960 and in 2023?
+##
+## (your result should have 5 columns, the country name, the indicator name,
+## the indicator code, and the populations in 1960 and the population in 2023).
+##
+## Remember how we eliminated all the "non-country" codes from WDI_COUNTRY
+## back in task 2?  The WDI_DATA table still contains them.
+##
+## BUT - that is OK, because one of the country names is "World".
+## Looking at the results of Task 3 - also filter on the most appropriate
+## `Indicator Code`.
+##
+## SO, keeping it simple, there are no joins or subqueries.
+## Your result should have 5 columns and 1 row.
+## ALSO, use FORMAT to make the resulting values pretty!
+#
+## (skills: select)
+##
+run_sql_and_return_html(cnx,"""
+SELECT 
+    `Country Name`,
+    `Indicator Name`,
+    `Indicator Code`,
+    FORMAT(`1960`, 0) AS `Population 1960`,
+    FORMAT(`2023`, 0) AS `Population 2023`
+FROM 
+    world_bank_data.wdi_data
+WHERE 
+    `Country Name` = 'World'
+    AND `Indicator Code` = 'SP.POP.TOTL';
+""")
+```
+
+## Task 5
+
+```{python}
+## That was fun! Let's investigate the other SP.POP.TOTL values.
+## Use a filter `Indicator Code` like 'SP.POP.TOTL%%'
+##
+## (your result should have 5 columns, the country name, the indicator name,
+## the indicator code, and the populations in 1960 and the population in 2023).
+##
+## (keeping it simple, there are no joins necessary.)
+## (skills: select)
+##
+
+run_sql_and_return_html(cnx,"""
+SELECT 
+    `Country Name`,
+    `Indicator Name`,
+    `Indicator Code`,
+    FORMAT(`1960`, 0) AS `Population 1960`,
+    FORMAT(`2023`, 0) AS `Population 2023`
+FROM 
+    world_bank_data.wdi_data
+WHERE 
+    `Indicator Code` LIKE 'SP.POP.TOTL%%' 
+    AND `Country Name` = 'World'
+ORDER BY 
+    `Indicator Code`;
+""")
+```
+
+
+## Task 6
+
+```{python}
+## What is the percentage of females in the world in 1960 and in 2023,
+## compared with the percentage of females in the US?
+##
+## The pre-calculated values are rounded to the nearest percent.  We need
+## at least 3 digits past the decimal point.  SO, we're going to have
+## to calculate it ourselves.
+##
+## (your result should consist of two rows ('World' and 'United States') and four columns:
+## the country name, the description ("Percent female"), the 1960
+## percent female and the 2023 percent female.
+##
+## Numeric values should show 3 places past the decimal AND include a 
+## % sign,  e.g., 33.333%  or 59.151%)
+##
+## (skills: select, aggregate, subquery/with, format, concat)
+
+run_sql_and_return_html(cnx,"""
+SELECT 
+    `Country Name`,
+    'Percent Female' AS `Description`,
+    concat(FORMAT(
+        (SUM(CASE WHEN `Indicator Code` = 'SP.POP.TOTL.FE.IN' AND `Country Name` = 'World' THEN `1960` ELSE 0 END) / 
+        SUM(CASE WHEN `Indicator Code` = 'SP.POP.TOTL' AND `Country Name` = 'World' THEN `1960` ELSE 0 END)) * 100, 3), '%%') 
+    AS `1960`,
+    concat(FORMAT(
+        (SUM(CASE WHEN `Indicator Code` = 'SP.POP.TOTL.FE.IN' AND `Country Name` = 'World' THEN `2023` ELSE 0 END) / 
+        SUM(CASE WHEN `Indicator Code` = 'SP.POP.TOTL' AND `Country Name` = 'World' THEN `2023` ELSE 0 END)) * 100, 3), '%%') 
+    AS `2023`
+FROM 
+    world_bank_data.wdi_data
+WHERE 
+    `Indicator Code` IN ('SP.POP.TOTL.FE.IN', 'SP.POP.TOTL') 
+    AND `Country Name` = 'World'
+GROUP BY 
+    `Country Name`
+ORDER BY 
+    `Country Name`;
+
+""")
+
+```
+
+## Task 7
+
+
+```{python}
+## WOW! that was difficult! Seems like a lot of work, forced to hardcode
+## years and values just to calculate percentages for these data.
+##
+## IS THERE A SIMPLER WAY?
+##
+## When doing data analysis, how your data are stacked make a difference.
+## Our lives would be much simpler if we rearranged the data with indicators
+## in the columns and years in the rows.
+##
+## BUT HOW??  
+##
+## The table WDI_DATA is currently stored in what is call a "wide format".
+## The data can be transformed into a more manageble format, in this case
+## a "stacked format" that will let us pivot things around much simpler.
+##
+## Create a new table named "wdi_data_stacked" containing stacked data from
+## WDI_DATA. Each row should have four columns: country_code, indicator_code,
+## year_code, and a value associated with the year.
+##
+## Filter WDI_DATA on just the population code 'SP.POP.TOTL%%' 
+## Keep all country codes.
+##
+## Stack data for 1960, 1970, 1980, 1990, 2000, 2010, and 2020
+## (skills: create table with select, UNION)
+
+execute_ddl(cnx, """
+DROP TABLE IF EXISTS wdi_data_stacked;
+
+CREATE TABLE wdi_data_stacked AS
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    1960 AS year_code,
+    `1960` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    1970 AS year_code,
+    `1970` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    1980 AS year_code,
+    `1980` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    1990 AS year_code,
+    `1990` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    2000 AS year_code,
+    `2000` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    2010 AS year_code,
+    `2010` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    `Country Code` AS country_code,
+    `Indicator Code` AS indicator_code,
+    2020 AS year_code,
+    `2020` AS value
+FROM world_bank_data.wdi_data
+WHERE `Indicator Code` LIKE 'SP.POP.TOTL%%' AND `Country Code` IS NOT NULL;
+""")
+
+```
+
+```{python}
+## Count records in new table
+run_sql_and_return_html(cnx, """
+SELECT COUNT(*) 
+FROM wdi_data_stacked;
+""")
+```
+
+
+```{python}
+## Verify the number of records
+run_sql_and_return_html(cnx,"""
+select * from wdi_data_stacked
+LIMIT 20
+""")
+```
+
+## Task 8
+
+```{python}
+## Time to get practice working with our newly stacked data!
+##
+## Create a summary table of the number of records in each year bundle
+
+run_sql_and_return_html(cnx,"""
+SELECT year_code, COUNT(*) 
+FROM wdi_data_stacked
+GROUP BY year_code
+ORDER BY year_code;
+""")
+```
+
+## Task 9
+
+```{python}
+## Phew. Glad that's over!  Let's recalculate percentage females for the
+## World and all decade years in our new wdi_data_stacked table.
+##
+## Your result should have five columns: country code, yeear, pct female,
+## pop female, and total pop.
+##  
+## (skills: select, aggregate, WITH/subquery, FORMAT)
+##
+
+run_sql_and_return_html(cnx, """
+WITH female_population AS (
+    SELECT country_code, 
+           year_code, 
+           SUM(CASE WHEN indicator_code = 'SP.POP.TOTL.FE.IN' THEN value ELSE 0 END) AS female_pop,
+           SUM(CASE WHEN indicator_code = 'SP.POP.TOTL' THEN value ELSE 0 END) AS total_pop
+    FROM wdi_data_stacked
+    WHERE indicator_code IN ('SP.POP.TOTL.FE.IN', 'SP.POP.TOTL')
+    AND year_code IN (1960, 1970, 1980, 1990, 2000, 2010, 2020)
+    GROUP BY country_code, year_code
+)
+SELECT country_code,
+       year_code AS year,
+       CONCAT(FORMAT(female_pop / total_pop * 100, 3), '%%') AS pct_female,
+       FORMAT(female_pop, 0) AS female_pop,
+       FORMAT(total_pop, 0) AS total_pop
+FROM female_population
+WHERE country_code = 'WLD'
+ORDER BY year_code;
+""")
+
+
+```
+
+## Task 10
+
+```{python}
+## Cool. Now let's compare the Pct. Female of US with the World over
+## all the decade years.
+##
+## You'll only need to modify the query from Task 9!
+## Your final table should have three columns: Year, US-Pct-Female and World-PCT-Female
+## and one row per year (1960, 1970, etc.)
+##
+## (skills: select, aggregate, WITH/subquery, FORMAT)
+##
+
+run_sql_and_return_html(cnx,"""
+WITH female_population AS (
+    SELECT country_code, 
+           year_code, 
+           SUM(CASE WHEN indicator_code = 'SP.POP.TOTL.FE.IN' THEN value ELSE 0 END) AS female_pop,
+           SUM(CASE WHEN indicator_code = 'SP.POP.TOTL' THEN value ELSE 0 END) AS total_pop
+    FROM wdi_data_stacked
+    WHERE indicator_code IN ('SP.POP.TOTL.FE.IN', 'SP.POP.TOTL')
+    AND year_code IN (1960, 1970, 1980, 1990, 2000, 2010, 2020)
+    GROUP BY country_code, year_code
+)
+SELECT World.year_code AS year,
+       CONCAT(FORMAT(US.female_pop / US.total_pop * 100, 3), '%%') AS US_Pct_Female,
+       CONCAT(FORMAT(World.female_pop / World.total_pop * 100, 3), '%%') AS World_Pct_Female
+FROM female_population World
+JOIN female_population US
+    ON US.country_code = 'USA' AND World.country_code = 'WLD'
+    AND US.year_code = World.year_code
+ORDER BY World.year_code;
+""")
+```
+
+## Task 11
+
+```{python}
+## OK. Ghost-pepper hot is nothing.  This is WAY HOTTER than that!!!
+##
+## Prepare a table comparing pct female by region in the world (rows) by
+## decade (columns, 1960-2020).
+##
+## This is very much like Tasks 9 and 10, except you'll need to do a bit more
+## pre-processing to map country codes to regions using our cleaned wdi_country table
+## from the earlier tasks.
+##
+## Build your query in layers, one WITH CTE at a time, checking each CTE to make sure
+## you've gathered the data that you need.
+##
+## Steps:
+## 1) Join wdi_country to wdi_data_stacked on `Country Code` for each year and indicator and country code and region
+## 2) then, following task 9, aggregate the female and total populations to columns by region and year
+## 3) then calculate the pct female for each year and region pair,
+## 4) pivot out (using CASE) the years
+##
+## (skills: select, aggregate, WITH/subquery, CASE, FORMAT)
+##
+
+run_sql_and_return_html(cnx,"""
+WITH population_data AS (
+    SELECT 
+        wc.Region, 
+        wd.year_code, 
+        wd.indicator_code, 
+        wd.value
+    FROM wdi_data_stacked wd
+    JOIN wdi_country wc ON wd.country_code = wc.`Country Code`
+    WHERE wd.indicator_code IN ('SP.POP.TOTL.FE.IN', 'SP.POP.TOTL')
+    AND wd.year_code IN (1960, 1970, 1980, 1990, 2000, 2010, 2020)
+)
+, female_population AS (
+    SELECT 
+        Region, 
+        year_code, 
+        SUM(value) AS female_pop
+    FROM population_data
+    WHERE indicator_code = 'SP.POP.TOTL.FE.IN'
+    GROUP BY Region, year_code
+)
+
+, total_population AS (
+    SELECT 
+        Region, 
+        year_code, 
+        SUM(value) AS total_pop
+    FROM population_data
+    WHERE indicator_code = 'SP.POP.TOTL'
+    GROUP BY Region, year_code
+)
+, female_percentage AS (
+    SELECT 
+        f.Region, 
+        f.year_code, 
+        ROUND(f.female_pop / t.total_pop * 100, 3) AS pct_female
+    FROM female_population f
+    JOIN total_population t ON f.Region = t.Region AND f.year_code = t.year_code
+)
+SELECT 
+    Region,
+    CONCAT(MAX(CASE WHEN year_code = 1960 THEN pct_female END), '%%') AS "1960",
+    CONCAT(MAX(CASE WHEN year_code = 1970 THEN pct_female END), '%%') AS "1970",
+    CONCAT(MAX(CASE WHEN year_code = 1980 THEN pct_female END), '%%') AS "1980",
+    CONCAT(MAX(CASE WHEN year_code = 1990 THEN pct_female END), '%%') AS "1990",
+    CONCAT(MAX(CASE WHEN year_code = 2000 THEN pct_female END), '%%') AS "2000",
+    CONCAT(MAX(CASE WHEN year_code = 2010 THEN pct_female END), '%%') AS "2010",
+    CONCAT(MAX(CASE WHEN year_code = 2020 THEN pct_female END), '%%') AS "2020"
+FROM female_percentage
+GROUP BY Region
+ORDER BY Region;
+""")
+```
+
+## Done!
+
+
+# Reflection
+
+1. In Task 3, you worked on joining tables to retrieve metadata describing the data in the WDI_DATA table. Reflect on the process of identifying relationships between tables. Why is understanding metadata important when working with datasets, and how does it enhance your ability to interpret and analyze the data?
+
+Understanding metadata is essential when working with datasets because it provides context and structure, helping to interpret and analyze the data accurately. Metadata clarifies the relationships between tables, such as primary and foreign keys, and describes the data's source, meaning, and units. This ensures the data is correctly combined and validated, allowing for accurate analysis. It also helps identify missing or inconsistent data, ensuring quality and consistency across different indicators and time periods. Additionally, metadata enables easier integration of data from various sources and facilitates filtering, improving both data accessibility and usability. In summary, metadata guides data interpretation, enhances analysis, and ensures the integrity of the data, making it essential for meaningful insights.
+
+1. Task 7 required transforming data from a wide format to a stacked format to simplify further analysis. What challenges did you encounter while designing and implementing this transformation? How might changing the format of data impact the efficiency of queries and analyses in real-world scenarios?
+
+When transforming data from a wide format to a stacked format, one of the primary challenges is ensuring that the transformation preserves data accuracy while restructuring it. In a wide format, multiple years of data are spread across several columns, making it difficult to compare across years or apply certain aggregate functions. The transformation process requires careful handling of the data types and ensuring that the "stacked" table correctly associates each data value with the corresponding year and indicator. This may also involve dealing with missing data or identifying rows that need to be split or merged.
+
+In real-world scenarios, changing the format of data can significantly improve the efficiency of queries and analyses. A stacked format often simplifies queries that involve comparisons over time or between groups, as each row represents a single observation at a specific point in time. This structure makes it easier to aggregate and filter the data, improving query performance and making analyses more straightforward. In contrast, wide format data may require complex joins or subqueries to aggregate or compare values, which can be less efficient and harder to manage, especially with large datasets. Therefore, converting to a stacked format can lead to faster data processing, better data organization, and easier analysis in many cases.
+
+1. Task 11 involved using Common Table Expressions (CTEs) to build a query incrementally, combining multiple layers of data processing. How did using CTEs help you organize and debug your query? Reflect on the advantages and potential challenges of using CTEs in SQL for complex data aggregations and transformations.
+
+Using Common Table Expressions (CTEs) in SQL provides several benefits for organizing and debugging complex queries. They allow for incremental query development, making it easier to build and test the query step by step. Each CTE can represent a distinct part of the data transformation process, improving the query’s modularity and readability. CTEs also facilitate easier debugging by enabling isolated testing of each part of the query, helping to identify errors more quickly. However, while CTEs improve query structure, they can sometimes lead to performance issues, particularly with large datasets or many nested CTEs, as they may be materialized or processed independently. Additionally, overusing CTEs or making them too complex can make the query harder to follow and maintain. Despite these challenges, CTEs are a powerful tool for organizing data transformations, improving query clarity, and simplifying maintenance, but they should be used judiciously to avoid potential performance bottlenecks.
+
+# README.md
+
+The section below imports your README.md directly into this report, allowing the graders
+to more quickly assess the quality of the section.
+
+Edit the README.md in your project root.  Re-rendering this document will update the section below.
+
+<hr/>
+
+{{< include ../README.md >}}
+
+<hr/>
+(end readme)
