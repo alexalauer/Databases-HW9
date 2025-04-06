@@ -2,7 +2,7 @@
 
 This project analyzes World Development Indicators (WDI) data using SQL to explore relationships between countries, regions and income categories. Tasks include identifying missing data, calculating percentages, and transforming data for better insights.
 
-## 📖 Table of Contents
+## Table of Contents
 
 1. [File Structure](#file-structure)
 2. [Analysis Overview](#analysis-overview)
